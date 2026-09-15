@@ -11,12 +11,13 @@
     
     <PackageId>BLite.Core</PackageId>
     <Version>5.1.1</Version>
+    <InformationalVersion>5.1.1+sequpl.transactional-index-root</InformationalVersion>
     <Authors>BLite Team</Authors>
     <Description>High-Performance BSON Database Engine Core Library — supports .NET 10 and .NET Standard 2.1</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageIcon>icon.png</PackageIcon>
-    <RepositoryUrl>https://github.com/EntglDb/BLite</RepositoryUrl>
+    <RepositoryUrl>https://github.com/SequPL/BLite</RepositoryUrl>
     <PackageTags>database;embedded;bson;nosql;net10;netstandard21;zero-allocation;maui;unity;xamarin</PackageTags>
     <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
   </PropertyGroup>

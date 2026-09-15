@@ -87,6 +87,7 @@ public sealed class Transaction : ITransaction
         await _storage.CommitTransactionAsync(_transactionId, ct);
 
         _state = TransactionState.Committed;
+        _storage.ReleaseCompletedTransaction(_transactionId);
 
         // Publish CDC events after successful commit
         if (_pendingChanges.Count > 0 && _storage.Cdc != null)
@@ -140,6 +141,7 @@ public sealed class Transaction : ITransaction
         _pendingChanges.Clear();
         await _storage.RollbackTransactionAsync(_transactionId);
         _state = TransactionState.Aborted;
+        _storage.ReleaseCompletedTransaction(_transactionId);
         
         InvokeOnRollbackHandlersSafely();
     }

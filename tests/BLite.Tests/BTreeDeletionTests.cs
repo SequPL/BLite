@@ -216,25 +216,33 @@ public class BTreeDeletionTests : IDisposable
     // to 1 page (single leaf that becomes the new root).
 
     [Fact]
-    public void Delete_MergeLeaves_CollapseRoot_SinglePageRemains()
+    public async Task Delete_MergeLeaves_CollapseRoot_SinglePageRemains()
     {
         var rootChanges = new List<uint>();
         var opts = IndexOptions.CreateBTree("field");
         var index = new BTreeIndex(_storage, opts, onRootChanged: newRoot => rootChanges.Add(newRoot));
 
-        var txnId = _storage.BeginTransaction().TransactionId;
+        using var seed = _storage.BeginTransaction();
+        var txnId = seed.TransactionId;
+        var initialRoot = index.RootPageId;
         int count = BTreeIndex.MaxEntriesPerNode + 1;
         foreach (var v in Enumerable.Range(1, count))
             index.Insert(IndexKey.Create(v), new DocumentLocation((uint)v, 0), txnId);
-        _storage.CommitTransactionAsync(txnId).GetAwaiter().GetResult();
+        await seed.CommitAsync();
+
+        using var deletion = _storage.BeginTransaction();
+        txnId = deletion.TransactionId;
 
         // Borrow first (brings both leaves to min)
         index.Delete(IndexKey.Create(1), new DocumentLocation(1, 0), txnId);
         // Merge + root collapse
         index.Delete(IndexKey.Create(2), new DocumentLocation(2, 0), txnId);
 
-        // After root collapse, onRootChanged must have fired at least once during deletes
-        Assert.NotEmpty(rootChanges);
+        await deletion.CommitAsync();
+
+        // Both split and collapse rewrite the original root inside their transaction.
+        Assert.Empty(rootChanges);
+        Assert.Equal(initialRoot, index.RootPageId);
 
         // The tree should now occupy exactly 1 page (the merged leaf = new root)
         var pages = index.CollectAllPages();

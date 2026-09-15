@@ -96,22 +96,18 @@ public sealed partial class StorageEngine
         if (!_activeTransactions.ContainsKey(transaction.TransactionId))
             throw new InvalidOperationException($"Transaction {transaction.TransactionId} is not active.");
 
-        try
-        {
-            await CommitTransactionAsync(transaction.TransactionId, ct);
-        }
-        finally
-        {
-            // Always clean up, even if the commit throws (timeout, etc.).
-            _activeTransactions.TryRemove(transaction.TransactionId, out _);
-        }
+        // Completion owns registry cleanup. A rejected/cancelled commit is still
+        // active and must remain registered for rollback or a subsequent retry.
+        await transaction.CommitAsync(ct);
     }
 
     public async Task RollbackTransactionAsync(Transaction transaction)
     {
-        await RollbackTransactionAsync(transaction.TransactionId);
-        _activeTransactions.TryRemove(transaction.TransactionId, out _);
+        await transaction.RollbackAsync();
     }
+
+    internal void ReleaseCompletedTransaction(ulong transactionId)
+        => _activeTransactions.TryRemove(transactionId, out _);
     
     // Rollback doesn't usually require async logic unless logging abort record is async, 
     // but for consistency we might consider it. For now, sync is fine as it's not the happy path bottleneck.

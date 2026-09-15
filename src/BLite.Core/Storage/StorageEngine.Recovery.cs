@@ -38,7 +38,7 @@ public sealed partial class StorageEngine
     /// </summary>
     public async Task CheckpointAsync(CancellationToken ct = default)
     {
-        if (_walIndex.IsEmpty) return;
+        if (_walIndex.IsEmpty && _retiredIndexPages.IsEmpty) return;
         if (Interlocked.CompareExchange(ref _checkpointRunning, 1, 0) != 0) return;
         var sw = _metrics != null ? Metrics.ValueStopwatch.StartNew() : default;
         try
@@ -53,7 +53,7 @@ public sealed partial class StorageEngine
                 safeOffset = Math.Min(_wal.GetCurrentSize(), _shm.GetMinReaderOffset());
 
             var snapshot = _walIndex.ToArray();
-            if (snapshot.Length == 0) return;
+            if (snapshot.Length == 0 && _retiredIndexPages.IsEmpty) return;
 
             // Build the set of entries that are safe to checkpoint.
             var toCheckpoint = new List<KeyValuePair<uint, byte[]>>(snapshot.Length);
@@ -68,7 +68,7 @@ public sealed partial class StorageEngine
                 toCheckpoint.Add(kvp);
             }
 
-            if (toCheckpoint.Count == 0) return;
+            if (toCheckpoint.Count == 0 && _retiredIndexPages.IsEmpty) return;
 
             foreach (var kvp in toCheckpoint)
                 GetPageFile(kvp.Key, out var physId).WritePage(physId, kvp.Value);
@@ -139,6 +139,7 @@ public sealed partial class StorageEngine
                     if (_walIndex.IsEmpty)
                     {
                         await _wal.TruncateAsync(ct);
+                        ReclaimRetiredIndexPages();
                         // Reset the SHM WAL index and end offset so other processes
                         // know the WAL has been cleared (Phase 4 / Phase 6).
                         if (_shm != null)

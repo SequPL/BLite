@@ -1,0 +1,7 @@
+<Project>
+  <!-- Keep this standalone repository independent of a containing application's
+       global usings and central package configuration when used as a submodule. -->
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+</Project>

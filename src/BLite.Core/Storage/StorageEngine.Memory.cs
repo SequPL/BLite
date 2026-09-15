@@ -8,6 +8,7 @@ namespace BLite.Core.Storage;
 
 public sealed partial class StorageEngine
 {
+    private readonly ConcurrentDictionary<uint, byte> _retiredIndexPages = new();
     // -----------------------------------------------------------------------
     // Multi-file pageId encoding
     //
@@ -48,6 +49,34 @@ public sealed partial class StorageEngine
 
         var localId = _indexFile.AllocatePage();
         return IndexPageMarker | (localId & IndexLocalMask);
+    }
+
+    internal uint AllocateIndexPage(ulong transactionId)
+    {
+        var pageId = AllocateIndexPage();
+        if (transactionId != 0 && _activeTransactions.TryGetValue(transactionId, out var transaction))
+            transaction.OnRollback += () => _retiredIndexPages.TryAdd(pageId, 0);
+        return pageId;
+    }
+
+    internal void RetireIndexPage(uint pageId, ulong transactionId)
+    {
+        if (transactionId == 0)
+            _retiredIndexPages.TryAdd(pageId, 0);
+        else if (_activeTransactions.TryGetValue(transactionId, out var transaction))
+            transaction.OnCommit += () => _retiredIndexPages.TryAdd(pageId, 0);
+        else
+            throw new InvalidOperationException("Index retirement requires an active transaction.");
+    }
+
+    // Called only under the checkpoint/commit gates, after all journal pages
+    // are durable and the journal has been cleared. Earlier reuse could let a
+    // checkpoint overwrite a new allocation with the retired node's old image.
+    private void ReclaimRetiredIndexPages()
+    {
+        if (!_walCache.IsEmpty) return;
+        foreach (var pageId in _retiredIndexPages.Keys)
+            if (_retiredIndexPages.TryRemove(pageId, out _)) FreePage(pageId);
     }
 
     /// <summary>

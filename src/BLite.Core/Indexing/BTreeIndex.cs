@@ -912,16 +912,45 @@ public sealed class BTreeIndex
 
     private void CreateNewRoot(uint leftChildId, IndexKey key, uint rightChildId, ulong transactionId)
     {
-        var newRootId = CreateNode(isLeaf: false, transactionId);
+        if (leftChildId != _rootPageId)
+            throw new InvalidOperationException("A root split must originate at the current root.");
+        // Keep the catalog's root page stable. Publishing a new in-memory root
+        // before its WAL transaction commits exposes an uninitialized page to
+        // readers, and rollback cannot restore that out-of-transaction pointer.
+        var leftCopyId = _storage.AllocateIndexPage(transactionId);
+        CopyNode(leftChildId, leftCopyId, transactionId);
+        var buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(_storage.PageSize);
+        try
+        {
+            ReadPage(leftCopyId, transactionId, buffer);
+            if (BTreeNodeHeader.ReadFrom(buffer.AsSpan(32)).IsLeaf)
+                UpdatePrevPointer(rightChildId, leftCopyId, transactionId);
+        }
+        finally { System.Buffers.ArrayPool<byte>.Shared.Return(buffer); }
         var entries = new List<InternalEntry> { new InternalEntry(key, rightChildId) };
-        WriteInternalNode(newRootId, leftChildId, entries, transactionId);
-        _rootPageId = newRootId;
-        NotifyRootChanged(); // Caller must re-persist the new root page ID in collection metadata
+        WriteInternalNode(_rootPageId, leftCopyId, entries, transactionId);
+    }
+
+    private void CopyNode(uint sourceId, uint destinationId, ulong transactionId)
+    {
+        var buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(_storage.PageSize);
+        try
+        {
+            ReadPage(sourceId, transactionId, buffer);
+            var header = PageHeader.ReadFrom(buffer);
+            header.PageId = destinationId;
+            header.WriteTo(buffer);
+            var nodeHeader = BTreeNodeHeader.ReadFrom(buffer.AsSpan(32));
+            nodeHeader.PageId = destinationId;
+            nodeHeader.WriteTo(buffer.AsSpan(32));
+            WritePage(destinationId, transactionId, buffer.AsSpan(0, _storage.PageSize));
+        }
+        finally { System.Buffers.ArrayPool<byte>.Shared.Return(buffer); }
     }
 
     private uint CreateNode(bool isLeaf, ulong transactionId)
     {
-        var pageId = _storage.AllocateIndexPage();
+        var pageId = _storage.AllocateIndexPage(transactionId);
         var pageBuffer = System.Buffers.ArrayPool<byte>.Shared.Rent(_storage.PageSize);
         try
         {
@@ -1598,9 +1627,7 @@ public sealed class BTreeIndex
         WriteInternalNode(parentId, p0, parentEntries, transactionId);
 
         // Free the empty Right Node
-        _storage.FreePage(rightNodeId); // Need to verify this works safely with Txn logic?
-                                         // Actually, FreePage is immediate in current impl. Might need TransactionalFreePage.
-                                         // Or just leave it allocated but unused for now.
+        _storage.RetireIndexPage(rightNodeId, transactionId);
 
         // Recursive Underflow Check on Parent
         int minInternal = MaxEntriesPerNode / 2;
@@ -1611,9 +1638,9 @@ public sealed class BTreeIndex
         }
         else if (parentId == _rootPageId && parentEntries.Count == 0)
         {
-            // Root collapse: P0 is the sole remaining child and becomes the new root.
-            _rootPageId = p0;
-            NotifyRootChanged(); // Caller must re-persist the new root page ID in collection metadata
+            // The root identity is stable across commit, rollback and reopen.
+            CopyNode(p0, _rootPageId, transactionId);
+            _storage.RetireIndexPage(p0, transactionId);
         }
     }
 

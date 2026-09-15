@@ -182,10 +182,11 @@ public class BTreeIndexAdditionalTests : IDisposable
     // ─── onRootChanged callback ───────────────────────────────────────────────
 
     [Fact]
-    public void OnRootChanged_Callback_IsInvokedWhenRootSplits()
+    public void OnRootChanged_Callback_IsNotInvokedWhenRootSplitsInPlace()
     {
         uint? capturedNewRoot = null;
         var (index, txnId) = CreateBTreeIndex(onRootChanged: newRoot => capturedNewRoot = newRoot);
+        var initialRoot = index.RootPageId;
 
         // Insert enough entries to force a root split
         for (int i = 1; i <= BTreeIndex.MaxEntriesPerNode + 1; i++)
@@ -193,10 +194,9 @@ public class BTreeIndexAdditionalTests : IDisposable
 
         _storage.CommitTransactionAsync(txnId).GetAwaiter().GetResult();
 
-        // Callback must have been invoked at least once
-        Assert.NotNull(capturedNewRoot);
-        // New root must differ from initial allocation (page 0 is invalid for an index)
-        Assert.True(capturedNewRoot.Value > 0);
+        // Splits rewrite the existing root transactionally; metadata stays valid.
+        Assert.Null(capturedNewRoot);
+        Assert.Equal(initialRoot, index.RootPageId);
     }
 
     [Fact]
