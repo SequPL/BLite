@@ -299,6 +299,7 @@ public sealed class PageFile : IPageStorage
     // Enables zero-alloc page reads via unsafe pointer instead of
     // CreateViewAccessor-per-read (which allocates an object + 16 KB temp array each time).
     private MemoryMappedViewAccessor? _readAccessor;
+    private MemoryMappedViewAccessor? _writeAccessor;
 
     // ── Encryption ────────────────────────────────────────────────────────────
     // Null means no encryption (zero overhead, unchanged file format).
@@ -316,7 +317,7 @@ public sealed class PageFile : IPageStorage
     // copies from — without exclusion that's a torn read, not just a structural race).
     // Read lock:  ReadPage() only.
     // Write lock: Open(), AllocatePage(), FreePage(), WritePage() (always — see its
-    //             remarks), Flush(), Dispose() — any operation that recreates
+    //             remarks), Dispose() — any operation that recreates
     //             _mappedFile, modifies structural state, or mutates page content.
     // ReaderWriterLockSlim allows many concurrent readers while serialising writers,
     // eliminating both the resize race (write lock disposes _mappedFile while a read
@@ -327,8 +328,9 @@ public sealed class PageFile : IPageStorage
     private int ReadLockTimeoutMs => _config.LockTimeout.ReadTimeoutMs;
     private int WriteLockTimeoutMs => _config.LockTimeout.WriteTimeoutMs;
 
-    // _asyncLock serialises FlushAsync() and BackupAsync(), which must hold exclusive
-    // access across an await boundary and therefore cannot use ReaderWriterLockSlim.
+    // Serialises durable flush, backup, truncation and disposal. Flush takes a
+    // separate view under _rwLock, then releases that lock before waiting for disk.
+    // Foreground page reads, writes and allocations do not wait for checkpoint I/O.
     private readonly SemaphoreSlim _asyncLock = new(1, 1);
 
     private volatile bool _disposed;
@@ -479,8 +481,7 @@ public sealed class PageFile : IPageStorage
 
             // Persistent read accessor — covers the whole mapped region (size=0 means entire file).
             // Used by ReadPageCore for zero-alloc reads via AcquirePointer.
-            _readAccessor?.Dispose();
-            _readAccessor = _mappedFile.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+            RecreateAccessorsCore();
 
             if (isNew)
             {
@@ -586,7 +587,7 @@ public sealed class PageFile : IPageStorage
     // They MUST only be called by code that already holds _rwLock in an
     // appropriate mode:
     //   ReadPageCore    — ReadLock or WriteLock
-    //   WritePageCore   — ReadLock or WriteLock
+    //   WritePageCore   — WriteLock only
     //   EnsureCapacityCore — WriteLock only (modifies _mappedFile)
 
     private void ThrowIfDisposed()
@@ -670,9 +671,7 @@ public sealed class PageFile : IPageStorage
             try
             {
                 _cryptoProvider.Encrypt(pageId, source[.._config.PageSize], tempBuf.AsSpan(0, _physicalPageSize));
-                using var accessor = _mappedFile!.CreateViewAccessor(offset, _physicalPageSize, MemoryMappedFileAccess.Write);
-                accessor.WriteArray(0, tempBuf, 0, _physicalPageSize);
-                accessor.Flush();
+                CopyToMappedPageCore(offset, tempBuf.AsSpan(0, _physicalPageSize));
             }
             finally
             {
@@ -681,14 +680,45 @@ public sealed class PageFile : IPageStorage
         }
         else
         {
-            using var accessor = _mappedFile!.CreateViewAccessor(offset, _config.PageSize, MemoryMappedFileAccess.Write);
-            accessor.WriteArray(0, source.ToArray(), 0, _config.PageSize);
-            // FlushViewOfFile is required to guarantee that writes made through the
-            // memory-mapped view are visible to subsequent ReadFile / RandomAccess.ReadAsync
-            // calls on the same handle. Without it, the OS does not guarantee coherency
-            // between the mapped-view pages and the buffered-file-I/O view.
-            accessor.Flush();
+            CopyToMappedPageCore(offset, source[.._config.PageSize]);
         }
+    }
+
+    private unsafe void CopyToMappedPageCore(long offset, ReadOnlySpan<byte> source)
+    {
+        if (_writeAccessor == null)
+            throw new InvalidOperationException("PageFile is read-only.");
+        byte* pointer = null;
+        _writeAccessor.SafeMemoryMappedViewHandle.AcquirePointer(ref pointer);
+        try
+        {
+            source.CopyTo(new Span<byte>(pointer + offset, source.Length));
+        }
+        finally
+        {
+            _writeAccessor.SafeMemoryMappedViewHandle.ReleasePointer();
+        }
+    }
+
+    private void RecreateAccessorsCore()
+    {
+        DisposeAccessorsCore();
+        _readAccessor = _mappedFile!.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+        if (_config.Access != MemoryMappedFileAccess.Read)
+            _writeAccessor = _mappedFile.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Write);
+    }
+
+    private void DisposeAccessorsCore()
+    {
+        // Accessor.Dispose implicitly flushes writable views. Close the handle first
+        // so resizing does not perform disk I/O under the page lock. Dirty mapped
+        // pages remain in the OS cache; explicit Flush/backup/truncate/dispose are
+        // the durability boundaries, and checkpoints retain the WAL until Flush ends.
+        _writeAccessor?.SafeMemoryMappedViewHandle.Dispose();
+        _writeAccessor?.Dispose();
+        _writeAccessor = null;
+        _readAccessor?.Dispose();
+        _readAccessor = null;
     }
 
     // ── Grow-file helper ───────────────────────────────────────────────────
@@ -717,8 +747,7 @@ public sealed class PageFile : IPageStorage
             leaveOpen: true);
 
         // Recreate the persistent read accessor so it covers the newly grown region.
-        _readAccessor?.Dispose();
-        _readAccessor = _mappedFile.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+        RecreateAccessorsCore();
     }
 
     // ── Public page I/O ────────────────────────────────────────────────────
@@ -978,20 +1007,45 @@ public sealed class PageFile : IPageStorage
     /// <summary>
     /// Flushes all pending writes to disk.
     /// Called by CheckpointManager after applying WAL changes.
-    /// Uses the write lock to serialise with concurrent file-growth operations.
+    /// A separate mapped view keeps the captured range alive while the file grows.
+    /// Disk I/O runs outside the page lock; disposal/truncation wait on _asyncLock.
     /// </summary>
     public void Flush()
     {
         ThrowIfDisposed();
-        if (!_rwLock.TryEnterWriteLock(WriteLockTimeoutMs))
-            throw new TimeoutException("Timed out acquiring PageFile write lock (Flush).");
+        if (!_asyncLock.Wait(WriteLockTimeoutMs))
+            throw new TimeoutException("Timed out acquiring PageFile async lock (Flush).");
         try
         {
-            _fileStream?.Flush(flushToDisk: true);
+            FlushCore();
         }
         finally
         {
-            _rwLock.ExitWriteLock();
+            _asyncLock.Release();
+        }
+    }
+
+    // Caller holds _asyncLock, protecting the stream lifetime and excluding shrink.
+    private void FlushCore()
+    {
+        MemoryMappedViewAccessor? view;
+        if (!_rwLock.TryEnterReadLock(ReadLockTimeoutMs))
+            throw new TimeoutException("Timed out acquiring PageFile read lock (Flush).");
+        try
+        {
+            ThrowIfDisposed();
+            // A read-only view can flush the shared mapping, and its Dispose does
+            // not repeat the flush. This view survives a concurrent mapping resize.
+            view = _mappedFile?.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+        }
+        finally
+        {
+            _rwLock.ExitReadLock();
+        }
+        using (view)
+        {
+            view?.Flush();
+            _fileStream?.Flush(flushToDisk: true);
         }
     }
 
@@ -1002,12 +1056,14 @@ public sealed class PageFile : IPageStorage
     /// </summary>
     public async Task FlushAsync(CancellationToken ct = default)
     {
+        ThrowIfDisposed();
         if (!await _asyncLock.WaitAsync(WriteLockTimeoutMs, ct).ConfigureAwait(false))
             throw new TimeoutException("Timed out acquiring PageFile async lock (FlushAsync).");
         try
         {
-            if (_fileStream != null)
-                await _fileStream.FlushAsync(ct).ConfigureAwait(false);
+            // FileStream.FlushAsync does not flush to stable storage. A checkpoint
+            // must flush both the mapped view and the disk before retiring its WAL.
+            await Task.Run(FlushCore, ct).ConfigureAwait(false);
         }
         finally
         {
@@ -1041,7 +1097,7 @@ public sealed class PageFile : IPageStorage
                 throw new InvalidOperationException("PageFile is not open.");
 
             // 1. Flush dirty pages from MMF to the OS page cache, then to disk.
-            _fileStream.Flush(flushToDisk: true);
+            FlushCore();
 
             // 2. Copy .db file under the lock so no concurrent FlushAsync can race.
             //    Re-use the existing _fileStream handle: _fileStream was opened with
@@ -1090,6 +1146,7 @@ public sealed class PageFile : IPageStorage
                     return;
 
                 // 1. Flush dirty pages to disk.
+                _writeAccessor?.Flush();
                 _fileStream.Flush(flushToDisk: true);
 
                 // 2. Walk backwards from the last page to find the last non-free page.
@@ -1128,8 +1185,7 @@ public sealed class PageFile : IPageStorage
                 }
 
                 // 4. Unmap, truncate, remap.
-                _readAccessor?.Dispose();
-                _readAccessor = null;
+                DisposeAccessorsCore();
                 _mappedFile.Dispose();
                 _mappedFile = null;
 
@@ -1143,7 +1199,7 @@ public sealed class PageFile : IPageStorage
                     _config.Access,
                     HandleInheritability.None,
                     leaveOpen: true);
-                _readAccessor = _mappedFile.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+                RecreateAccessorsCore();
 
                 // 5. Rewrite the free list chain with only valid (retained) entries.
                 _firstFreePageId = 0;
@@ -1162,6 +1218,7 @@ public sealed class PageFile : IPageStorage
                     }
                 }
                 UpdateFileHeaderFreePtrCore(_firstFreePageId);
+                _writeAccessor?.Flush();
                 _fileStream.Flush(flushToDisk: true);
             }
             finally
@@ -1183,9 +1240,10 @@ public sealed class PageFile : IPageStorage
         // Acquire _asyncLock first to drain any in-flight FlushAsync / BackupAsync,
         // then acquire _rwLock write lock to block all concurrent reads and writes.
         // Lock order (_asyncLock before _rwLock) must be respected everywhere.
-        // Best-effort: if locks cannot be acquired, proceed anyway so Dispose() never throws.
-        bool asyncLockAcquired = _asyncLock.Wait(WriteLockTimeoutMs);
-        bool rwLockAcquired = _rwLock.TryEnterWriteLock(WriteLockTimeoutMs);
+        // A slow checkpoint must finish before its views or stream are closed.
+        // The operation timeout is not permission to dispose live I/O resources.
+        _asyncLock.Wait();
+        _rwLock.EnterWriteLock();
         try
         {
             if (_disposed)
@@ -1194,12 +1252,12 @@ public sealed class PageFile : IPageStorage
             // 1. Flush any pending writes from memory-mapped file
             if (_fileStream != null)
             {
+                _writeAccessor?.Flush();
                 _fileStream.Flush(flushToDisk: true);
             }
             
             // 2. Close memory-mapped file first (and the persistent read accessor that depends on it)
-            _readAccessor?.Dispose();
-            _readAccessor = null;
+            DisposeAccessorsCore();
             _mappedFile?.Dispose();
             _mappedFile = null;
             
@@ -1215,22 +1273,10 @@ public sealed class PageFile : IPageStorage
         }
         finally
         {
-            if (rwLockAcquired)
-                _rwLock.ExitWriteLock();
-
-            // Dispose only if we hold the write lock; if another thread still holds
-            // a read/write lock, disposing ReaderWriterLockSlim would produce undefined
-            // behaviour or SynchronizationLockException — violating "Dispose never throws".
-            if (rwLockAcquired)
-            {
-                try { _rwLock.Dispose(); } catch { /* best-effort */ }
-            }
-
-            if (asyncLockAcquired)
-            {
-                _asyncLock.Release();
-                try { _asyncLock.Dispose(); } catch { /* best-effort */ }
-            }
+            _rwLock.ExitWriteLock();
+            _asyncLock.Release();
+            // Keep the gates alive for callers already queued when disposal began;
+            // they observe _disposed after acquiring the gate.
         }
 
         GC.SuppressFinalize(this);
