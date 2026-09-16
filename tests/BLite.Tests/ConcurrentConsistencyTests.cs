@@ -129,6 +129,10 @@ public class ConcurrentConsistencyTests : IDisposable
         var readErrors = new ConcurrentBag<string>();
         var readSuccesses = new ConcurrentBag<int>();
         using var cts = new CancellationTokenSource();
+        var firstReads = Enumerable.Range(0, readerCount)
+            .Select(_ => new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously))
+            .ToArray();
+        var readersHaveRead = Task.WhenAll(firstReads.Select(signal => signal.Task));
 
         // Writers: each thread inserts into its own collection
         var writerTasks = Enumerable.Range(0, writerCount).Select(t => Task.Run(async () =>
@@ -141,6 +145,11 @@ public class ConcurrentConsistencyTests : IDisposable
                     .AddInt32("writer", t)
                     .AddInt32("seq", i)));
                 writeIds.Add((t, id));
+                // Keep writers active until every reader has actually observed data.
+                // Task.Run enqueue order does not guarantee that readers start before
+                // these fast inserts finish, particularly on a small CI worker.
+                if (i == 0)
+                    await readersHaveRead.WaitAsync(TimeSpan.FromSeconds(30));
             }
             await session.CommitAsync();
         })).ToArray();
@@ -149,31 +158,44 @@ public class ConcurrentConsistencyTests : IDisposable
         var readerTasks = Enumerable.Range(0, readerCount).Select(r => Task.Run(async () =>
         {
             int reads = 0;
-            while (!cts.Token.IsCancellationRequested)
+            try
             {
-                using var session = _engine.OpenSession();
-                var col = session.GetOrCreateCollection(readCollection);
-                var idx = reads % seedCount;
-                var doc = await col.FindByIdAsync(seedIds[idx]);
-                if (doc == null)
+                while (!cts.Token.IsCancellationRequested)
                 {
-                    readErrors.Add($"Reader {r}: seeded doc {seedIds[idx]} not found on read #{reads}");
-                    break;
+                    using var session = _engine.OpenSession();
+                    var col = session.GetOrCreateCollection(readCollection);
+                    var idx = reads % seedCount;
+                    var doc = await col.FindByIdAsync(seedIds[idx]);
+                    if (doc == null)
+                    {
+                        readErrors.Add($"Reader {r}: seeded doc {seedIds[idx]} not found on read #{reads}");
+                        break;
+                    }
+                    if (!doc.TryGetInt32("value", out var val) || val != idx)
+                    {
+                        readErrors.Add($"Reader {r}: expected value={idx}, got {val} for doc {seedIds[idx]}");
+                        break;
+                    }
+                    reads++;
+                    firstReads[r].TrySetResult(true);
+                    if (reads >= 500) break;
                 }
-                if (!doc.TryGetInt32("value", out var val) || val != idx)
-                {
-                    readErrors.Add($"Reader {r}: expected value={idx}, got {val} for doc {seedIds[idx]}");
-                    break;
-                }
-                reads++;
-                if (reads >= 500) break;
             }
-            readSuccesses.Add(reads);
+            finally
+            {
+                // A failed reader must unblock writers so the original assertion or
+                // exception is reported instead of leaving background work waiting.
+                firstReads[r].TrySetResult(false);
+                readSuccesses.Add(reads);
+            }
         })).ToArray();
 
-        await Task.WhenAll(writerTasks);
-        cts.Cancel();
-        await Task.WhenAll(readerTasks);
+        try { await Task.WhenAll(writerTasks); }
+        finally
+        {
+            cts.Cancel();
+            await Task.WhenAll(readerTasks);
+        }
 
         // Assert no read errors
         Assert.True(readErrors.IsEmpty,

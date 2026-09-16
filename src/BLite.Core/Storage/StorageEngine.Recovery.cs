@@ -88,13 +88,13 @@ public sealed partial class StorageEngine
             // Drain _walIndex (and _walOffsets) entries that we successfully flushed.
             // Track the highest checkpointed WAL offset in the same loop (avoids a
             // second O(n) pass over toCheckpoint).
-            // ReferenceEquals check ensures we only remove the exact version we flushed.
+            // Compare and remove atomically: a commit can publish a newer page between
+            // a separate TryGetValue/ReferenceEquals check and a key-only TryRemove.
             long maxCheckpointedOffset = 0;
             foreach (var kvp in toCheckpoint)
             {
-                if (_walIndex.TryGetValue(kvp.Key, out var current) && ReferenceEquals(current, kvp.Value))
+                if (((ICollection<KeyValuePair<uint, byte[]>>)_walIndex).Remove(kvp))
                 {
-                    _walIndex.TryRemove(kvp.Key, out _);
                     // Track max offset while removing from _walOffsets.
                     if (_walOffsets != null && _walOffsets.TryRemove(kvp.Key, out long removedOffset)
                         && removedOffset > maxCheckpointedOffset)

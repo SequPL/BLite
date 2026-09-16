@@ -13,7 +13,7 @@ namespace BLite.Tests
     /// </summary>
     public class CrossCollectionWriteRaceTests : IDisposable
     {
-        private static readonly TimeSpan Duration = TimeSpan.FromSeconds(5);
+        private const int Rounds = 512;
 
         private readonly string _path;
 
@@ -24,9 +24,8 @@ namespace BLite.Tests
 
         public void Dispose()
         {
-            foreach (var suffix in new[] { "", ".wal" })
+            foreach (var file in new[] { _path, Path.ChangeExtension(_path, ".wal") })
             {
-                var file = _path + suffix;
                 if (File.Exists(file)) File.Delete(file);
             }
         }
@@ -34,87 +33,94 @@ namespace BLite.Tests
         [Fact]
         public async Task Concurrent_Inserts_Into_Different_Collections_LoseNothing()
         {
-            using var db = new TestDbContext(_path);
-            using var cts = new CancellationTokenSource(Duration);
-
-            var failures = new System.Collections.Concurrent.ConcurrentBag<Exception>();
-            var writtenIds = new System.Collections.Concurrent.ConcurrentBag<string>();
-
-            var stringWriter = Run(async () =>
+            var strings = new Dictionary<string, string>();
+            var integers = new Dictionary<int, string>();
+            var users = new Dictionary<BLite.Bson.ObjectId, (string Name, int Age)>();
+            using (var db = new TestDbContext(_path))
             {
-                var i = 0;
-                while (!cts.IsCancellationRequested)
+                // A round is a start/finish boundary for three concurrent writes. Each
+                // collection must make progress; a fast producer cannot flood the
+                // shared gate while another is waiting for its thread-pool continuation.
+                // Checkpoints race with each batch instead of depending on a timer
+                // or machine throughput to cross the automatic checkpoint threshold.
+                for (var i = 1; i <= Rounds; i++)
                 {
-                    var id = Guid.NewGuid().ToString();
-                    await db.StringEntities.InsertAsync(new StringEntity
+                    var sequence = i;
+                    var roundStarted = System.Diagnostics.Stopwatch.StartNew();
+                    try
                     {
-                        Id = id,
-                        Value = new string('s', 200 + (i % 900)),
-                    });
-                    writtenIds.Add(id);
-                    i++;
-                }
-            });
-
-            var intWriter = Run(async () =>
-            {
-                // Ids start at 1: 0 is default(int) and is treated as "no id assigned".
-                var i = 1;
-                while (!cts.IsCancellationRequested)
-                {
-                    await db.IntEntities.InsertAsync(new IntEntity
+                        await Task.WhenAll(
+                            Task.Run(async () =>
+                            {
+                                var entity = new StringEntity
+                                {
+                                    Id = Guid.NewGuid().ToString(),
+                                    Value = new string('s', 200 + sequence % 900),
+                                };
+                                await db.StringEntities.InsertAsync(entity);
+                                strings.Add(entity.Id, entity.Value);
+                            }),
+                            Task.Run(async () =>
+                            {
+                                var entity = new IntEntity
+                                {
+                                    Id = sequence,
+                                    Name = new string('i', 200 + sequence % 900),
+                                };
+                                await db.IntEntities.InsertAsync(entity);
+                                integers.Add(entity.Id, entity.Name);
+                            }),
+                            Task.Run(async () =>
+                            {
+                                var entity = new User
+                                {
+                                    Name = new string('u', 200 + sequence % 900),
+                                    Age = sequence,
+                                };
+                                await db.Users.InsertAsync(entity);
+                                users.Add(entity.Id, (entity.Name, entity.Age));
+                            }),
+                            Task.Run(() => db.Storage.CheckpointAsync()));
+                    }
+                    catch (Exception error)
                     {
-                        Id = i,
-                        Name = new string('i', 200 + (i % 900)),
-                    });
-                    i++;
+                        throw new InvalidOperationException(
+                            $"Concurrent write round {sequence}/{Rounds} failed after {roundStarted.ElapsedMilliseconds} ms; "
+                            + $"thread pool threads={ThreadPool.ThreadCount}, pending={ThreadPool.PendingWorkItemCount}.", error);
+                    }
                 }
-            });
-
-            var userWriter = Run(async () =>
-            {
-                var i = 0;
-                while (!cts.IsCancellationRequested)
-                {
-                    await db.Users.InsertAsync(new User
-                    {
-                        Name = new string('u', 200 + (i % 900)),
-                        Age = i,
-                    });
-                    i++;
-                }
-            });
-
-            await Task.WhenAll(stringWriter, intWriter, userWriter);
-
-            Assert.True(
-                failures.IsEmpty,
-                $"{failures.Count} writer failure(s); first: {failures.FirstOrDefault()}");
-
-            // A page handed to two collections drops slots without reporting anything at write
-            // time, so every id written has to come back and every document has to be intact.
-            var seen = new HashSet<string>();
-            await foreach (var e in db.StringEntities.FindAllAsync())
-            {
-                Assert.StartsWith("s", e.Value);
-                seen.Add(e.Id);
+                await Verify(db);
             }
 
-            var missing = writtenIds.Where(id => !seen.Contains(id)).ToList();
-            Assert.True(
-                missing.Count == 0,
-                $"{missing.Count} of {writtenIds.Count} inserted documents are not enumerable "
-                + $"(FindAllAsync returned {seen.Count}); first missing id: {missing.FirstOrDefault()}");
+            using var reopened = new TestDbContext(_path);
+            await Verify(reopened);
 
-            await foreach (var e in db.IntEntities.FindAllAsync()) Assert.StartsWith("i", e.Name);
-            await foreach (var e in db.Users.FindAllAsync()) Assert.StartsWith("u", e.Name);
-
-            Task Run(Func<Task> body) => Task.Run(async () =>
+            async Task Verify(TestDbContext db)
             {
-                try { await body(); }
-                catch (OperationCanceledException) { }
-                catch (Exception ex) { failures.Add(ex); }
-            });
+                var seenStrings = new HashSet<string>();
+                await foreach (var entity in db.StringEntities.FindAllAsync())
+                {
+                    Assert.True(seenStrings.Add(entity.Id), "Duplicate string ID");
+                    Assert.Equal(strings[entity.Id], entity.Value);
+                }
+                Assert.Equal(Rounds, seenStrings.Count);
+
+                var seenIntegers = new HashSet<int>();
+                await foreach (var entity in db.IntEntities.FindAllAsync())
+                {
+                    Assert.True(seenIntegers.Add(entity.Id), "Duplicate integer ID");
+                    Assert.Equal(integers[entity.Id], entity.Name);
+                }
+                Assert.Equal(Rounds, seenIntegers.Count);
+
+                var seenUsers = new HashSet<BLite.Bson.ObjectId>();
+                await foreach (var entity in db.Users.FindAllAsync())
+                {
+                    Assert.True(seenUsers.Add(entity.Id), "Duplicate user ID");
+                    Assert.Equal(users[entity.Id], (entity.Name, entity.Age));
+                }
+                Assert.Equal(Rounds, seenUsers.Count);
+            }
         }
     }
 }

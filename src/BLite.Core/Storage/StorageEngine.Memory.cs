@@ -130,7 +130,7 @@ public sealed partial class StorageEngine
             var collName = GetCollectionNameBySlot(slot);
             if (collName != null)
                 return GetOrCreateCollectionFile(collName);
-            // Slot not found (e.g. file was dropped) — fall through to main file
+            throw new InvalidOperationException($"Collection slot {slot} for page {pageId} is not registered.");
         }
 
         physicalPageId = pageId;
@@ -138,8 +138,14 @@ public sealed partial class StorageEngine
     }
 
     private string? GetCollectionNameBySlot(int slot)
-        => (_collectionSlotToName != null && _collectionSlotToName.TryGetValue(slot, out var name))
-            ? name : null;
+    {
+        // Registration publishes both directions under this lock. A plain Dictionary
+        // cannot be read while another collection is registering/resizing it, and the
+        // forward mapping can become visible before the reverse mapping is populated.
+        lock (_collectionSlotLock)
+            return _collectionSlotToName != null && _collectionSlotToName.TryGetValue(slot, out var name)
+                ? name : null;
+    }
 
     private IPageStorage GetOrCreateCollectionFile(string collectionName)
     {
