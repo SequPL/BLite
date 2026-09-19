@@ -38,6 +38,12 @@ public interface IWriteAheadLog : IDisposable
     Task TruncateAsync(CancellationToken ct = default);
 
     /// <summary>
+    /// Synchronous variant of <see cref="TruncateAsync"/> for callers that must not await
+    /// (engine construction / crash recovery on a thread with a synchronization context).
+    /// </summary>
+    void Truncate();
+
+    /// <summary>
     /// Reads and returns all WAL records (used during crash recovery).
     /// Returns an empty list for implementations that do not persist records.
     /// </summary>

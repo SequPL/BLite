@@ -138,8 +138,7 @@ public sealed partial class StorageEngine
                     // between our IsEmpty check and acquiring the lock.
                     if (_walIndex.IsEmpty)
                     {
-                        await _wal.TruncateAsync(ct);
-                        ReclaimRetiredIndexPages();
+                        await _wal.TruncateAsync(ct).ConfigureAwait(false);                        ReclaimRetiredIndexPages();
                         // Reset the SHM WAL index and end offset so other processes
                         // know the WAL has been cleared (Phase 4 / Phase 6).
                         if (_shm != null)
@@ -231,14 +230,12 @@ public sealed partial class StorageEngine
 
         var backupTimestamp = DateTimeOffset.UtcNow;
 
-        if (!await _commitLock.WaitAsync(_config.LockTimeout.WriteTimeoutMs, ct))
-            throw new TimeoutException("Timed out acquiring commit lock (Backup).");
+        if (!await _commitLock.WaitAsync(_config.LockTimeout.WriteTimeoutMs, ct).ConfigureAwait(false))            throw new TimeoutException("Timed out acquiring commit lock (Backup).");
 
         List<BackupCopyOperation>? operations = null;
         try
         {
-            await CheckpointAsync(ct);
-            if (_walIndex.IsEmpty)
+            await CheckpointAsync(ct).ConfigureAwait(false);            if (_walIndex.IsEmpty)
                 await _wal.TruncateAsync(ct).ConfigureAwait(false);
 
             operations = BuildBackupPlan(destinationDbPath, includeIndexes);
@@ -292,68 +289,120 @@ public sealed partial class StorageEngine
     }
     
     /// <summary>
-    /// Recovers from crash by replaying WAL.
-    /// Applies all committed transactions to PageFile, then truncates WAL.
+    /// Recovers from a crash by replaying the WAL synchronously. Applies all committed
+    /// transactions to the page files, flushes them, then truncates the WAL.
+    /// <para>
+    /// The constructor uses this overload on purpose. Hosts construct the engine from
+    /// dependency injection on UI threads (Android main looper, WinUI dispatcher); blocking
+    /// such a thread on <see cref="RecoverAsync"/> deadlocked the process whenever a
+    /// continuation was posted back to the blocked thread's <see cref="SynchronizationContext"/>.
+    /// This path never awaits and therefore never depends on the caller's context.
+    /// </para>
     /// </summary>
-    public async Task RecoverAsync(CancellationToken ct = default)
+    public void Recover()
     {
-        if (!await _commitLock.WaitAsync(_config.LockTimeout.WriteTimeoutMs))
+        if (!_commitLock.Wait(_config.LockTimeout.WriteTimeoutMs))
             throw new TimeoutException("Timed out acquiring commit lock (Recovery).");
         try
         {
-            // 1. Read WAL and identify committed transactions
-            var records = _wal.ReadAll();
-            var committedTxns = new HashSet<ulong>();
-            var txnWrites = new Dictionary<ulong, List<(uint pageId, byte[] data)>>();
-            
-            foreach (var record in records)
-            {
-                if (record.Type == WalRecordType.Commit)
-                    committedTxns.Add(record.TransactionId);
-                else if (record.Type == WalRecordType.Write)
-                {
-                    if (!txnWrites.ContainsKey(record.TransactionId))
-                        txnWrites[record.TransactionId] = new List<(uint, byte[])>();
-                    
-                    if (record.AfterImage != null)
-                    {
-                        txnWrites[record.TransactionId].Add((record.PageId, record.AfterImage));
-                    }
-                }
-            }
-            
-            // 2. Apply committed transactions to the correct PageFile
-            foreach (var txnId in committedTxns)
-            {
-                if (!txnWrites.ContainsKey(txnId))
-                    continue;
-                    
-                foreach (var (pageId, data) in txnWrites[txnId])
-                {
-                    var targetFile = GetPageFile(pageId, out var physId);
-                    targetFile.WritePage(physId, data);
-                }
-            }
-            
-            // 3. Flush all PageFiles to ensure durability
-            await _pageFile.FlushAsync(ct);
-            if (_indexFile != null)
-                await _indexFile.FlushAsync(ct);
+            ApplyCommittedWalRecords();
+
+            // Flush all page files to ensure durability before the WAL is discarded.
+            _pageFile.Flush();
+            _indexFile?.Flush();
             if (_collectionFiles != null)
             {
                 foreach (var lazy in _collectionFiles.Values)
                     if (lazy.IsValueCreated) lazy.Value.Flush();
             }
-            
-            // 4. Clear in-memory WAL index (redundant since we just recovered)
+
+            // Clear the in-memory WAL index (redundant since we just recovered).
             _walIndex.Clear();
-            
-            // 5. Truncate WAL (all changes now in PageFile)
-            await _wal.TruncateAsync(ct);
+
+            // Truncate the WAL (all changes are now in the page files).
+            _wal.Truncate();
         }
         finally
         {
             _commitLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Recovers from crash by replaying WAL.
+    /// Applies all committed transactions to PageFile, then truncates WAL.
+    /// Never call this from a blocking wait on a thread that owns a
+    /// <see cref="SynchronizationContext"/>; use <see cref="Recover"/> there.
+    /// </summary>
+    public async Task RecoverAsync(CancellationToken ct = default)
+    {
+        if (!await _commitLock.WaitAsync(_config.LockTimeout.WriteTimeoutMs, ct).ConfigureAwait(false))
+            throw new TimeoutException("Timed out acquiring commit lock (Recovery).");
+        try
+        {
+            ApplyCommittedWalRecords();
+
+            // Flush all PageFiles to ensure durability
+            await _pageFile.FlushAsync(ct).ConfigureAwait(false);
+            if (_indexFile != null)
+                await _indexFile.FlushAsync(ct).ConfigureAwait(false);
+            if (_collectionFiles != null)
+            {
+                foreach (var lazy in _collectionFiles.Values)
+                    if (lazy.IsValueCreated) lazy.Value.Flush();
+            }
+
+            // Clear in-memory WAL index (redundant since we just recovered)
+            _walIndex.Clear();
+
+            // Truncate WAL (all changes now in PageFile)
+            await _wal.TruncateAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _commitLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Reads the WAL, identifies committed transactions and writes their after-images to
+    /// the owning page files. Shared by the synchronous and asynchronous recovery paths.
+    /// Caller holds <c>_commitLock</c>.
+    /// </summary>
+    private void ApplyCommittedWalRecords()
+    {
+        // 1. Read WAL and identify committed transactions
+        var records = _wal.ReadAll();
+        var committedTxns = new HashSet<ulong>();
+        var txnWrites = new Dictionary<ulong, List<(uint pageId, byte[] data)>>();
+
+        foreach (var record in records)
+        {
+            if (record.Type == WalRecordType.Commit)
+                committedTxns.Add(record.TransactionId);
+            else if (record.Type == WalRecordType.Write)
+            {
+                if (!txnWrites.ContainsKey(record.TransactionId))
+                    txnWrites[record.TransactionId] = new List<(uint, byte[])>();
+
+                if (record.AfterImage != null)
+                {
+                    txnWrites[record.TransactionId].Add((record.PageId, record.AfterImage));
+                }
+            }
+        }
+
+        // 2. Apply committed transactions to the correct PageFile
+        foreach (var txnId in committedTxns)
+        {
+            if (!txnWrites.ContainsKey(txnId))
+                continue;
+
+            foreach (var (pageId, data) in txnWrites[txnId])
+            {
+                var targetFile = GetPageFile(pageId, out var physId);
+                targetFile.WritePage(physId, data);
+            }
         }
     }
 

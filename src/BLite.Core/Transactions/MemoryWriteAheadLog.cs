@@ -140,6 +140,22 @@ public sealed class MemoryWriteAheadLog : IWriteAheadLog
     }
 
     /// <inheritdoc/>
+    public void Truncate()
+    {
+        if (!_lock.Wait(_writeTimeoutMs))
+            throw new TimeoutException("Timed out acquiring MemoryWriteAheadLog lock.");
+        try
+        {
+            _records.Clear();
+            _sizeBytes = 0;
+        }
+        finally
+        {
+            _lock.Release();
+        }
+    }
+
+    /// <inheritdoc/>
     public List<WalRecord> ReadAll()
     {
         if (!_lock.Wait(_writeTimeoutMs))

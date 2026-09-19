@@ -421,13 +421,13 @@ public sealed class WriteAheadLog : IWriteAheadLog
 
     public async Task FlushAsync(CancellationToken ct = default)
     {
-        if (!await _lock.WaitAsync(_writeTimeoutMs, ct))
+        if (!await _lock.WaitAsync(_writeTimeoutMs, ct).ConfigureAwait(false))
             throw new TimeoutException("Timed out acquiring WAL write lock.");
         try
         {
             if (_walStream != null)
             {
-                await _walStream.FlushAsync(ct);
+                await _walStream.FlushAsync(ct).ConfigureAwait(false);
                 // FlushAsync doesn't guarantee flushToDisk on all platforms/implementations in the same way as Flush(true)
                 // but FileStream in .NET 6+ handles this reasonable well. 
                 // For strict durability, we might still want to invoke a sync flush or check platform specifics,
@@ -878,12 +878,12 @@ public sealed class WriteAheadLog : IWriteAheadLog
 
 
     /// <summary>
-    /// Truncates the WAL file (removes all content).
-    /// Should only be called after successful checkpoint.
+    /// Synchronously truncates the WAL file (removes all content). Used by engine
+    /// construction, which must not await on the caller's thread.
     /// </summary>
-    public async Task TruncateAsync(CancellationToken ct = default)
+    public void Truncate()
     {
-        if (!await _lock.WaitAsync(_writeTimeoutMs, ct))
+        if (!_lock.Wait(_writeTimeoutMs))
             throw new TimeoutException("Timed out acquiring WAL write lock.");
         try
         {
@@ -891,7 +891,32 @@ public sealed class WriteAheadLog : IWriteAheadLog
             {
                 _walStream.SetLength(0);
                 _walStream.Position = 0;
-                await _walStream.FlushAsync(ct);
+                _walStream.Flush();
+                // Reset so the crypto file header is re-written on the next record write.
+                _cryptoInitialized = false;
+            }
+        }
+        finally
+        {
+            _lock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Truncates the WAL file (removes all content).
+    /// Should only be called after successful checkpoint.
+    /// </summary>
+    public async Task TruncateAsync(CancellationToken ct = default)
+    {
+        if (!await _lock.WaitAsync(_writeTimeoutMs, ct).ConfigureAwait(false))
+            throw new TimeoutException("Timed out acquiring WAL write lock.");
+        try
+        {
+            if (_walStream != null)
+            {
+                _walStream.SetLength(0);
+                _walStream.Position = 0;
+                await _walStream.FlushAsync(ct).ConfigureAwait(false);
                 // Reset so the crypto file header is re-written on the next record write.
                 _cryptoInitialized = false;
             }

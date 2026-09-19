@@ -228,11 +228,15 @@ public sealed partial class StorageEngine : IDisposable
             });
             _writerTask = Task.Run(() => GroupCommitWriterAsync(_writerCts.Token));
             
-            // RecoverAsync from WAL if exists (crash recovery or resume after close)
-            // This replays any committed transactions not yet checkpointed
+            // Recover from the WAL if it exists (crash recovery or resume after close).
+            // This replays any committed transactions not yet checkpointed. The
+            // synchronous overload is required here: constructing the engine from a
+            // blocking wait on RecoverAsync() deadlocked hosts whose calling thread owns
+            // a SynchronizationContext (Blazor Hybrid DI on the Android/WinUI UI thread),
+            // because the recovery continuations were posted back to that blocked thread.
             if (_wal.GetCurrentSize() > 0)
             {
-                RecoverAsync().GetAwaiter().GetResult();
+                Recover();
             }
             
             InitializeDictionary();
