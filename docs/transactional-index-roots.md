@@ -41,6 +41,28 @@ reuse. Persisting a crash-recoverable retirement queue is outside this patch.
 
 ## Regression coverage
 
+### Overflow page lifetime and legacy free lists
+
+Overflow deletion previously called `FreePage` immediately, before transaction
+commit. A rollback left live document pages on the free list. Checkpoint could
+then restore their slotted headers over free-list nodes. Reading such a node as
+`PageHeader` interpreted `FreeSpaceStart = 24` as `NextPageId = 0x18000000`
+(402653184), reproducing the Android out-of-bounds read exactly.
+
+Overflow pages now use the same deferred retirement queue as index pages:
+rollback preserves them, and commit makes them reusable only after checkpoint.
+Allocation validates the free-list head's bounds, page identity, type and next
+pointer. An invalid list is abandoned and persisted as empty; allocation then
+appends pages. This preserves page contents, at the cost of potentially leaked
+free space. Claimed pages are marked empty so cycles cannot allocate a page
+twice while its replacement is still only in the WAL. This does not reconstruct
+document bytes already overwritten by older versions.
+
+`DocumentOverflowTests` covers rollback before/after checkpoint and repeated
+large-document updates followed by further inserts. `PageFileFreeListRecoveryTests`
+covers reopening files with a wild head or a live overflow page incorrectly
+listed as free, with both plain and encrypted storage.
+
 `BTreeTransactionRegressionTests` covers root split rollback through two tree
 levels, merge commit/rollback, repeated merge/split/checkpoint/reopen, exact
 lookups, forward/reverse scans, transaction state, callbacks, and registry

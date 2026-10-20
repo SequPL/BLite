@@ -60,13 +60,17 @@ public sealed partial class StorageEngine
     }
 
     internal void RetireIndexPage(uint pageId, ulong transactionId)
+        => RetirePage(pageId, transactionId);
+
+    // Overflow pages have the same commit/checkpoint lifetime as retired index nodes.
+    internal void RetirePage(uint pageId, ulong transactionId)
     {
         if (transactionId == 0)
             _retiredIndexPages.TryAdd(pageId, 0);
         else if (_activeTransactions.TryGetValue(transactionId, out var transaction))
             transaction.OnCommit += () => _retiredIndexPages.TryAdd(pageId, 0);
         else
-            throw new InvalidOperationException("Index retirement requires an active transaction.");
+            throw new InvalidOperationException("Page retirement requires an active transaction.");
     }
 
     // Called only under the checkpoint/commit gates, after all journal pages

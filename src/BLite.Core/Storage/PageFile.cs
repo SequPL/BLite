@@ -937,16 +937,30 @@ public sealed class PageFile : IPageStorage
                 
                 // Read the recycled page to update the free list head
                 var buffer = new byte[_config.PageSize];
-                ReadPageCore(recycledPageId, buffer);
-                var header = PageHeader.ReadFrom(buffer);
-                
-                // The new head is what the recycled page pointed to
-                _firstFreePageId = header.NextPageId;
-                
-                // UpdateAsync file header (Page 0) to point to new head
-                UpdateFileHeaderFreePtrCore(_firstFreePageId);
-                
-                return recycledPageId;
+                if (IsMappedAllocationPage(recycledPageId))
+                {
+                    ReadPageCore(recycledPageId, buffer);
+                    var header = PageHeader.ReadFrom(buffer);
+                    if (header.PageId == recycledPageId && header.PageType == PageType.Free
+                        && header.NextPageId != recycledPageId
+                        && (header.NextPageId == 0 || IsMappedAllocationPage(header.NextPageId)))
+                    {
+                        _firstFreePageId = header.NextPageId;
+                        UpdateFileHeaderFreePtrCore(_firstFreePageId);
+                        // Claim before returning: a stale/cyclic list must never hand
+                        // the same page to another allocation waiting for a WAL write.
+                        Array.Clear(buffer, 0, buffer.Length);
+                        new PageHeader { PageId = recycledPageId, PageType = PageType.Empty }.WriteTo(buffer);
+                        WritePageCore(recycledPageId, buffer);
+                        return recycledPageId;
+                    }
+                }
+
+                // Older versions freed overflow pages before commit. WAL recovery can
+                // restore live data over such a free-list node. Abandon the untrusted
+                // list, preserving every page, and append instead of reusing live data.
+                _firstFreePageId = 0;
+                UpdateFileHeaderFreePtrCore(0);
             }
 
             // 2. No free pages, append new one
@@ -1005,6 +1019,12 @@ public sealed class PageFile : IPageStorage
         }
     }
     
+    // Called only while _rwLock write lock is held.
+    private bool IsMappedAllocationPage(uint pageId)
+        => pageId > 1 && pageId < _nextPageId && _readAccessor != null
+            && _cryptoFileHeaderSize + (long)pageId * _physicalPageSize
+                <= _readAccessor.Capacity - _physicalPageSize;
+
     // Called only while _rwLock write lock is held.
     private void UpdateFileHeaderFreePtrCore(uint newHead)
     {

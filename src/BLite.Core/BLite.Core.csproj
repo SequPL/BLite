@@ -11,7 +11,7 @@
     
     <PackageId>BLite.Core</PackageId>
     <Version>5.1.1</Version>
-    <InformationalVersion>5.1.1+sequpl.transactional-index-root</InformationalVersion>
+    <InformationalVersion>5.1.1+sequpl.transactional-page-lifetime</InformationalVersion>
     <Authors>BLite Team</Authors>
     <Description>High-Performance BSON Database Engine Core Library — supports .NET 10 and .NET Standard 2.1</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>

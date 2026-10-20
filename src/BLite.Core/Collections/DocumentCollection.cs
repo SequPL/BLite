@@ -3132,8 +3132,9 @@ public class DocumentCollection<TId, T> : IDocumentCollection<TId, T>, IDisposab
                 var header = SlottedPageHeader.ReadFrom(tempBuffer);
                 var nextPage = header.NextOverflowPage;
 
-                // Recycle this page
-                _storage.FreePage(overflowPageId);
+                // Rollback still needs these bytes. Even after commit, an older WAL
+                // image could overwrite a reused page until checkpoint has drained it.
+                _storage.RetirePage(overflowPageId, transaction.TransactionId);
 
                 overflowPageId = nextPage;
             }

@@ -5,6 +5,57 @@ namespace BLite.Tests;
 
 public class DocumentOverflowTests : IDisposable
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RolledBackOverflowDeletion_CheckpointDoesNotCorruptFreeList(bool checkpointBeforeDeletion)
+    {
+        var user = new User { Id = ObjectId.NewObjectId(), Name = Payload(50000), Age = 1 };
+        await _db.Users.InsertAsync(user);
+        await _db.SaveChangesAsync();
+        if (checkpointBeforeDeletion) await _db.CheckpointAsync();
+        using (var transaction = _db.BeginTransaction())
+        {
+            Assert.True(await _db.Users.DeleteAsync(user.Id, transaction));
+            await transaction.RollbackAsync();
+        }
+        Assert.Equal(user.Name, (await _db.Users.FindByIdAsync(user.Id))!.Name);
+        await _db.CheckpointAsync();
+        Assert.Equal(user.Name, (await _db.Users.FindByIdAsync(user.Id))!.Name);
+        for (var i = 0; i < 3; i++)
+            await _db.Users.InsertAsync(new User { Id = ObjectId.NewObjectId(), Name = Payload(50000 + i), Age = i });
+        await _db.SaveChangesAsync();
+        Assert.Equal(user.Name, (await _db.Users.FindByIdAsync(user.Id))!.Name);
+    }
+
+    [Fact]
+    public async Task RepeatedOverflowUpdates_CheckpointAndFurtherInsertsRemainReadable()
+    {
+        var user = new User { Id = ObjectId.NewObjectId(), Name = Payload(50000), Age = 1 };
+        await _db.Users.InsertAsync(user);
+        await _db.SaveChangesAsync();
+        await _db.CheckpointAsync();
+        for (var i = 0; i < 12; i++)
+        {
+            user.Name = Payload(50000 + i * 1000);
+            Assert.True(await _db.Users.UpdateAsync(user));
+            await _db.SaveChangesAsync();
+            await _db.CheckpointAsync();
+            Assert.Equal(user.Name, (await _db.Users.FindByIdAsync(user.Id))!.Name);
+            var another = new User { Id = ObjectId.NewObjectId(), Name = Payload(60000), Age = i };
+            await _db.Users.InsertAsync(another);
+            await _db.SaveChangesAsync();
+            Assert.Equal(another.Name, (await _db.Users.FindByIdAsync(another.Id))!.Name);
+        }
+    }
+
+    private static string Payload(int size)
+    {
+        var bytes = new byte[size];
+        new Random(size).NextBytes(bytes);
+        return Convert.ToBase64String(bytes);
+    }
+
     private readonly string _dbPath;
     private readonly TestDbContext _db;
 
