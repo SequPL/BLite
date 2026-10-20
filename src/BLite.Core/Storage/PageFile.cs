@@ -596,10 +596,27 @@ public sealed class PageFile : IPageStorage
             throw new ObjectDisposedException(nameof(PageFile));
     }
 
+    // Called while holding the page-file lock, so the accessor cannot be replaced
+    // between validation and copying. Never construct a span over an unchecked pointer:
+    // corrupt page IDs would otherwise cause an uncatchable native access violation.
+    private long GetReadOffsetCore(uint pageId)
+    {
+        var accessor = _readAccessor ?? throw new InvalidOperationException("Page file is not open for reading.");
+        var offset = checked(_cryptoFileHeaderSize + (long)pageId * _physicalPageSize);
+        var capacity = accessor.Capacity;
+        // Validate the entire physical page, including the authentication tag when
+        // encrypted, even for header reads. Subtraction avoids end-offset overflow.
+        if (offset < 0 || capacity < _physicalPageSize || offset > capacity - _physicalPageSize)
+            throw new InvalidDataException(
+                $"Page read outside mapped file: pageId={pageId}, offset={offset}, " +
+                $"physicalPageSize={_physicalPageSize}, mappedLength={capacity}, nextPageId={_nextPageId}.");
+        return offset;
+    }
+
     private unsafe void ReadPageCore(uint pageId, Span<byte> destination)
     {
         // Physical byte offset of this page within the file.
-        var offset = _cryptoFileHeaderSize + (long)pageId * _physicalPageSize;
+        var offset = GetReadOffsetCore(pageId);
         byte* basePtr = null;
         _readAccessor!.SafeMemoryMappedViewHandle.AcquirePointer(ref basePtr);
         try
@@ -624,7 +641,7 @@ public sealed class PageFile : IPageStorage
 
     private unsafe void ReadPageHeaderCore(uint pageId, Span<byte> destination)
     {
-        var offset = _cryptoFileHeaderSize + (long)pageId * _physicalPageSize;
+        var offset = GetReadOffsetCore(pageId);
         byte* basePtr = null;
         _readAccessor!.SafeMemoryMappedViewHandle.AcquirePointer(ref basePtr);
         try
